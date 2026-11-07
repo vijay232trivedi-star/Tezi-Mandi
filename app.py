@@ -1,191 +1,239 @@
+"""Personal trading journal and the existing historical market data explorer."""
+
 import datetime as dt
+import sqlite3
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import yfinance as yf
-from plotly.subplots import make_subplots
 
-st.set_page_config(page_title="Market Data Explorer", page_icon="📊", layout="wide")
+from journal_store import JournalStore, TRADE_COLUMNS, market_now
+from market_explorer import show_market_explorer
 
-IST = "Asia/Kolkata"
+st.set_page_config(page_title="Tezi Mandi · Trading Journal", page_icon="📒", layout="wide")
 
-POPULAR = {
-    "NIFTY 50": "^NSEI",
-    "BANK NIFTY": "^NSEBANK",
-    "SENSEX": "^BSESN",
-    "RELIANCE": "RELIANCE.NS",
-    "HDFC BANK": "HDFCBANK.NS",
-    "ICICI BANK": "ICICIBANK.NS",
-    "INFOSYS": "INFY.NS",
-    "TCS": "TCS.NS",
-    "SBIN": "SBIN.NS",
-    "TATA MOTORS": "TATAMOTORS.NS",
-    "Other (type symbol)": "",
+COLORS = {"BUY": "#16a34a", "SELL": "#e05252"}
+LABELS = {
+    "trade_date": "Date", "trade_time": "Time (IST)", "side": "Side",
+    "symbol": "Stock Name / Symbol", "quantity": "Quantity", "price": "Price (₹)",
+    "amount": "Trade Value (₹)", "notes": "Notes",
 }
 
-# Free intraday data is only available for recent days.
-INTERVAL_MAX_DAYS_BACK = {"1m": 7, "5m": 59, "15m": 59, "30m": 59, "60m": 700}
+
+def trades_frame(trades):
+    frame = pd.DataFrame(trades, columns=TRADE_COLUMNS)
+    for column in ("quantity", "price"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame["amount"] = (frame["quantity"] * frame["price"]).round(2)
+    return frame
 
 
-def normalize_symbol(text: str) -> str:
-    s = text.strip().upper()
-    if not s:
-        return ""
-    if s.startswith("^") or "." in s:
-        return s
-    return s + ".NS"
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def load_data(symbol: str, start: dt.date, end: dt.date, interval: str) -> pd.DataFrame:
-    df = yf.download(
-        symbol,
-        start=start,
-        end=end + dt.timedelta(days=1),  # end is exclusive
-        interval=interval,
-        progress=False,
-        auto_adjust=False,
-    )
-    if df is None or df.empty:
-        return pd.DataFrame()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
-    if df.index.tz is None:
-        df.index = df.index.tz_localize("UTC")
-    df.index = df.index.tz_convert(IST)
-    df.index.name = "Datetime (IST)"
-    return df.round(2)
-
-
-def show_summary(df: pd.DataFrame):
-    o, c = df["Open"].iloc[0], df["Close"].iloc[-1]
-    h, l = df["High"].max(), df["Low"].min()
-    vol = df["Volume"].sum()
-    chg = c - o
-    chg_pct = chg / o * 100 if o else 0
-
-    cols = st.columns(6)
-    cols[0].metric("Open", f"{o:,.2f}")
-    cols[1].metric("High", f"{h:,.2f}")
-    cols[2].metric("Low", f"{l:,.2f}")
-    cols[3].metric("Close", f"{c:,.2f}", f"{chg:+.2f} ({chg_pct:+.2f}%)")
-    cols[4].metric("Range", f"{h - l:,.2f}")
-    if vol > 0:
-        tp = (df["High"] + df["Low"] + df["Close"]) / 3
-        vwap = (tp * df["Volume"]).sum() / vol
-        cols[5].metric("VWAP", f"{vwap:,.2f}")
-        st.caption(f"Total volume: {int(vol):,}")
+def display_trades(frame, *, include_side=True, key=None):
+    if include_side:
+        columns = ["trade_date", "trade_time", "side", "symbol"]
     else:
-        cols[5].metric("Volume", "n/a (index)")
-
-
-def show_chart(df: pd.DataFrame, title: str):
-    has_volume = df["Volume"].sum() > 0
-    rows = 2 if has_volume else 1
-    fig = make_subplots(
-        rows=rows,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.03,
-        row_heights=[0.75, 0.25] if has_volume else [1],
+        columns = ["symbol", "trade_time"]
+    columns += ["quantity", "price", "amount", "notes"]
+    st.dataframe(
+        frame[columns].rename(columns=LABELS), hide_index=True,
+        width="stretch", key=key,
+        column_config={
+            "Stock Name / Symbol": st.column_config.TextColumn(width="medium"),
+            "Quantity": st.column_config.NumberColumn(format="%d"),
+            "Price (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+            "Trade Value (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+        },
     )
-    fig.add_trace(
-        go.Candlestick(
-            x=df.index,
-            open=df["Open"],
-            high=df["High"],
-            low=df["Low"],
-            close=df["Close"],
-            name="Price",
-        ),
-        row=1,
-        col=1,
-    )
-    if has_volume:
-        fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume"), row=2, col=1)
-    fig.update_layout(
-        title=title,
-        height=620,
-        xaxis_rangeslider_visible=False,
-        showlegend=False,
-        margin=dict(l=10, r=10, t=50, b=10),
-    )
-    st.plotly_chart(fig, use_container_width=True)
 
 
-# ---------------- UI ----------------
-st.title("📊 Market Data Explorer")
-st.write("Pick a stock or index and a date to view and download historical market data.")
+def csv_data(frame):
+    return frame[["id", *LABELS]].rename(columns=LABELS).to_csv(index=False).encode("utf-8-sig")
+
+
+def flash(message):
+    st.session_state["journal_message"] = message
+    st.rerun()
+
+
+def entry_form(store, side, day):
+    with st.form(f"add_{side}", clear_on_submit=True):
+        symbol = st.text_input("Stock Name / Symbol", key=f"{side}_symbol",
+                               placeholder="e.g. RELIANCE or HDFC Bank")
+        with st.expander("Optional trade details"):
+            left, right = st.columns(2)
+            quantity = left.number_input("Quantity (optional)", min_value=1, value=None,
+                                         step=1, key=f"{side}_quantity")
+            price = right.number_input("Price per share (₹, optional)", min_value=0.01,
+                                       value=None, step=0.01, format="%.2f", key=f"{side}_price")
+            time = st.time_input("Trade time (IST)", value=market_now().time().replace(microsecond=0),
+                                 key=f"{side}_time")
+            notes = st.text_input("Notes (optional)", key=f"{side}_notes",
+                                  placeholder="Setup, reason for entry, or lessons")
+        submitted = st.form_submit_button(f"Add {side} trade", type="primary",
+                                         width="stretch")
+    if submitted:
+        try:
+            store.add_trade(trade_date=day, trade_time=time, side=side, symbol=symbol,
+                            quantity=quantity, price=price, notes=notes)
+        except (ValueError, sqlite3.Error) as error:
+            st.error(str(error))
+        else:
+            flash(f"{side} trade saved for {day:%d %b %Y}.")
+
+
+def manage_trades(store, frame, today):
+    if frame.empty:
+        return
+    with st.expander("Edit or delete an entry"):
+        records = {int(row["id"]): row for row in frame.to_dict("records")}
+        trade_id = st.selectbox(
+            "Choose an entry", list(records), key="manage_trade",
+            format_func=lambda value: f"#{value} · {records[value]['trade_time']} · "
+                                      f"{records[value]['side']} · {records[value]['symbol']}",
+        )
+        trade = records[trade_id]
+        with st.form(f"edit_{trade_id}"):
+            left, right = st.columns(2)
+            symbol = left.text_input("Stock Name / Symbol", value=trade["symbol"])
+            side = right.selectbox("Side", ["BUY", "SELL"], index=["BUY", "SELL"].index(trade["side"]))
+            day = left.date_input("Trade date", value=dt.date.fromisoformat(trade["trade_date"]),
+                                  max_value=today)
+            time = right.time_input("Trade time (IST)", value=dt.time.fromisoformat(trade["trade_time"]))
+            quantity = left.number_input("Quantity (optional)", min_value=1, step=1,
+                                         value=None if pd.isna(trade["quantity"]) else int(trade["quantity"]))
+            price = right.number_input("Price per share (₹, optional)", min_value=0.01,
+                                       step=0.01, format="%.2f",
+                                       value=None if pd.isna(trade["price"]) else float(trade["price"]))
+            notes = st.text_input("Notes (optional)", value=trade["notes"])
+            saved = st.form_submit_button("Save changes", type="primary")
+        if saved:
+            try:
+                store.update_trade(trade_id, trade_date=day, trade_time=time, side=side,
+                                   symbol=symbol, quantity=quantity, price=price, notes=notes)
+            except (ValueError, sqlite3.Error) as error:
+                st.error(str(error))
+            else:
+                flash("Trade updated.")
+        confirmed = st.checkbox("Confirm deletion of this entry", key=f"confirm_delete_{trade_id}")
+        if st.button("Delete entry", disabled=not confirmed, key=f"delete_{trade_id}"):
+            try:
+                store.delete_trade(trade_id)
+            except (ValueError, sqlite3.Error) as error:
+                st.error(str(error))
+            else:
+                flash("Trade deleted.")
+
+
+def show_analysis(store, today):
+    st.subheader("Trading activity analysis")
+    left, right = st.columns(2)
+    start = left.date_input("From", value=today - dt.timedelta(days=29),
+                            max_value=today, key="analysis_start")
+    end = right.date_input("To", value=today, max_value=today, key="analysis_end")
+    if start > end:
+        st.error("'From' date must be on or before 'To' date.")
+        return
+    frame = trades_frame(store.list_trades(start, end))
+    if frame.empty:
+        st.info("No trades recorded in this date range. Add an entry to start tracking your activity.")
+        return
+    cols = st.columns(4)
+    cols[0].metric("BUY trades in range", int((frame["side"] == "BUY").sum()))
+    cols[1].metric("SELL trades in range", int((frame["side"] == "SELL").sum()))
+    cols[2].metric("Stocks traded", frame["symbol"].nunique())
+    cols[3].metric("Active trading days", frame["trade_date"].nunique())
+    daily = frame.groupby(["trade_date", "side"]).size().unstack(fill_value=0)
+    daily = daily.reindex(pd.date_range(start, end).strftime("%Y-%m-%d"), fill_value=0)
+    fig = go.Figure()
+    for side in ("BUY", "SELL"):
+        fig.add_bar(name=side, x=daily.index,
+                    y=daily[side] if side in daily else [0] * len(daily),
+                    marker_color=COLORS[side])
+    fig.update_layout(barmode="group", height=320, margin=dict(l=10, r=10, t=20, b=10),
+                      yaxis_title="Number of trades", xaxis_title="Trade date (IST)",
+                      yaxis=dict(dtick=1), legend=dict(orientation="h"))
+    st.plotly_chart(fig, width="stretch")
+    activity = frame.groupby(["symbol", "side"]).size().unstack(fill_value=0)
+    activity = activity.reindex(columns=["BUY", "SELL"], fill_value=0)
+    activity["Total trades"] = activity.sum(axis=1)
+    st.markdown("**Activity by stock**")
+    st.dataframe(activity.rename_axis("Stock Name / Symbol").reset_index(),
+                 hide_index=True, width="stretch")
+    left, right = st.columns(2)
+    for column, side in ((left, "BUY"), (right, "SELL")):
+        values = frame.loc[frame["side"] == side, "amount"]
+        column.metric(f"Recorded {side} value", f"₹{values.sum():,.2f}")
+    st.caption("Recorded values include only entries with both quantity and price. "
+               "BUY and SELL values exclude fees and taxes; they do not represent profit or loss.")
+    with st.expander("All entries in this date range"):
+        display_trades(frame, key="history_table")
+    st.download_button("Download history CSV", data=csv_data(frame),
+                       file_name=f"trading_journal_{start}_{end}.csv", mime="text/csv", on_click="ignore")
+
+
+def show_journal():
+    today = market_now().date()
+    with st.sidebar:
+        st.header("Trading day")
+        day = st.date_input("Journal date", value=today, max_value=today, key="journal_day")
+        st.caption("Dates and trade times use Asia/Kolkata (IST).")
+        if st.button("Refresh journal", width="stretch"):
+            st.rerun()
+    try:
+        store = JournalStore()
+        todays_trades = trades_frame(store.list_trades(today, today))
+        day_trades = todays_trades if day == today else trades_frame(store.list_trades(day, day))
+    except (OSError, sqlite3.Error) as error:
+        st.error(f"Could not open the journal: {error}")
+        st.stop()
+
+    st.title("📒 Daily Trading Journal")
+    st.write("Record your trades, review your day, and build a clear picture of your trading activity.")
+    if message := st.session_state.pop("journal_message", None):
+        st.success(message)
+    st.caption(f"Today · {today:%A, %d %B %Y} · IST")
+    buy_total, sell_total = st.columns(2)
+    buy_total.metric("Today's total BUY trades", int((todays_trades["side"] == "BUY").sum()))
+    sell_total.metric("Today's total SELL trades", int((todays_trades["side"] == "SELL").sum()))
+    st.caption("Totals count individual trade entries. You can record the same stock multiple times.")
+
+    daily_tab, analysis_tab = st.tabs(["Daily BUY & SELL", "History & analysis"])
+    with daily_tab:
+        label = "Today's activity" if day == today else "Trading day"
+        st.subheader(f"{label} · {day:%d %b %Y}")
+        st.caption("Enter a stock name or symbol to save a trade. Quantity, price, and notes are optional.")
+        buy_column, sell_column = st.columns(2, gap="large")
+        for column, side, icon in ((buy_column, "BUY", "🟢"), (sell_column, "SELL", "🔴")):
+            with column:
+                with st.container(border=True):
+                    section = day_trades[day_trades["side"] == side]
+                    st.subheader(f"{icon} {side}")
+                    st.caption(f"{len(section)} trade{'s' if len(section) != 1 else ''} recorded for this day")
+                    entry_form(store, side, day)
+                    st.markdown(f"**{side} trades**")
+                    if section.empty:
+                        st.info(f"No {side} trades recorded for this day.")
+                    display_trades(section, include_side=False, key=f"{side}_table")
+        if not day_trades.empty:
+            st.download_button("Download this day's CSV", data=csv_data(day_trades),
+                               file_name=f"trading_journal_{day}.csv", mime="text/csv", on_click="ignore")
+        manage_trades(store, day_trades, today)
+    with analysis_tab:
+        try:
+            show_analysis(store, today)
+        except sqlite3.Error as error:
+            st.error(f"Could not read journal history: {error}")
+    st.divider()
+    st.caption("Your journal is saved locally. Keep a backup of data/trading_journal.sqlite3 "
+               "or export your entries as CSV.")
+
 
 with st.sidebar:
-    st.header("Choose data")
-    choice = st.selectbox("Stock / Index", list(POPULAR.keys()))
-    if POPULAR[choice]:
-        symbol = POPULAR[choice]
-    else:
-        custom = st.text_input("NSE symbol (e.g. ITC, WIPRO) or Yahoo symbol", "ITC")
-        symbol = normalize_symbol(custom)
+    st.title("Tezi Mandi")
+    page = st.radio("View", ["Trading Journal", "Market Data Explorer"])
+    st.divider()
 
-    mode = st.radio("Mode", ["Single day (intraday)", "Date range (daily)"])
-    today = dt.date.today()
-
-    if mode == "Single day (intraday)":
-        interval = st.selectbox("Candle size", list(INTERVAL_MAX_DAYS_BACK.keys()), index=1)
-        min_date = today - dt.timedelta(days=INTERVAL_MAX_DAYS_BACK[interval])
-        day = st.date_input("Date", value=today, min_value=min_date, max_value=today)
-        start, end = day, day
-        st.caption(
-            f"Free {interval} data is available for roughly the last "
-            f"{INTERVAL_MAX_DAYS_BACK[interval]} days only."
-        )
-    else:
-        interval = "1d"
-        start = st.date_input("From", value=today - dt.timedelta(days=90), max_value=today)
-        end = st.date_input("To", value=today, max_value=today)
-
-    go_btn = st.button("Get data", type="primary", use_container_width=True)
-
-if go_btn:
-    if not symbol:
-        st.error("Please enter a symbol.")
-    elif start > end:
-        st.error("'From' date must be before 'To' date.")
-    else:
-        with st.spinner("Fetching data..."):
-            try:
-                data = load_data(symbol, start, end, interval)
-            except Exception as e:  # network / rate limit / bad symbol
-                data = pd.DataFrame()
-                st.error(f"Could not fetch data: {e}")
-
-        if data.empty:
-            st.warning(
-                "No data found. The market may have been closed (weekend/holiday), "
-                "the symbol may be wrong, or the date is outside the free data window."
-            )
-        else:
-            label = f"{choice if POPULAR[choice] else symbol} — {start}" + (
-                f" to {end}" if start != end else ""
-            )
-            show_summary(data)
-            show_chart(data, label)
-            st.subheader("Data")
-            st.dataframe(data, use_container_width=True)
-            st.download_button(
-                "⬇️ Download CSV",
-                data=data.to_csv().encode("utf-8"),
-                file_name=f"{symbol.replace('^', '')}_{start}_{end}_{interval}.csv",
-                mime="text/csv",
-            )
+if page == "Trading Journal":
+    show_journal()
 else:
-    st.info("Choose a stock and date in the sidebar, then click **Get data**.")
-
-st.divider()
-st.caption(
-    "Disclaimer: This tool shows historical market data for information and education only. "
-    "It is not investment advice, a recommendation, or a research report. Data comes from a "
-    "third-party source, may be delayed or inaccurate, and is not guaranteed. Trading in "
-    "equities and F&O involves substantial risk of loss."
-)
+    show_market_explorer()
